@@ -1,0 +1,6 @@
+streamlit>=1.28.0
+openai-whisper>=20231117
+torch
+torchaudio
+openai>=1.0.0
+yt-dlp>=2024.1.0

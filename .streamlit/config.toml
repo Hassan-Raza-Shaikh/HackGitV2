@@ -1,0 +1,3 @@
+# Avoid Streamlit file watcher touching torch (prevents RuntimeError with torch.classes)
+[server]
+fileWatcherType = "none"
