@@ -19,6 +19,7 @@ import requests
 import tempfile
 from moviepy import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 import os
+import concurrent.futures
 
 # Use unverified SSL context so Whisper model download works behind corporate proxy / self-signed certs
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -271,14 +272,128 @@ def match_keywords_to_gifs(keywords, signs):
     return matched
 
 
+
+    return matched
+
+
+def get_letter_url(char: str) -> str:
+    """Return Lifeprint URL for a single letter fingerspelling GIF."""
+    char = char.lower()
+    if not char.isalpha():
+        return None
+    return f"https://www.lifeprint.com/asl101/fingerspelling/abc-gifs/{char}.gif"
+
+
+def generate_sign_video(terms, signs_db):
+    """
+    Stitches GIFs for the given terms into a single MP4 video.
+    Falls back to fingerspelling if a term is not found in signs_db or Lifeprint.
+    Uses parallel downloading for speed.
+    """
+    if not terms:
+        return None
+
+    clips = []
+    
+    try:
+        # Create a temp directory for downloads
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 1. Prepare list of items to fetch in order
+            # item = (index, label, url, is_fingerspell)
+            fetch_list = []
+            
+            for term in terms:
+                term_clean = term.strip()
+                if not term_clean:
+                    continue
+                
+                # Check Whole Word
+                url = get_sign_url(term_clean, signs_db)
+                
+                if url:
+                    fetch_list.append({
+                        "label": term_clean,
+                        "url": url,
+                        "is_fs": False
+                    })
+                else:
+                    # Fallback: Fingerspell
+                    for char in term_clean:
+                        if char.isalpha():
+                            l_url = get_letter_url(char)
+                            if l_url:
+                                fetch_list.append({
+                                    "label": char.upper(),
+                                    "url": l_url,
+                                    "is_fs": True
+                                })
+            
+            if not fetch_list:
+                return None
+
+            # 2. Parallel Download
+            downloaded_files = [None] * len(fetch_list)
+            
+            def download_item(idx, item):
+                try:
+                    resp = requests.get(item["url"], timeout=5)
+                    if resp.status_code == 200:
+                        fname = os.path.join(temp_dir, f"clip_{idx}.gif")
+                        with open(fname, "wb") as f:
+                            f.write(resp.content)
+                        return idx, fname
+                except Exception as e:
+                    print(f"Error downloading {item['label']}: {e}")
+                return idx, None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(download_item, i, item) for i, item in enumerate(fetch_list)]
+                for future in concurrent.futures.as_completed(futures):
+                    idx, fname = future.result()
+                    if fname:
+                        downloaded_files[idx] = fname
+            
+            # 3. Create Clips in Order
+            for fname in downloaded_files:
+                if fname:
+                    try:
+                        clip = VideoFileClip(fname)
+                        clip = clip.resized(height=400)
+                        clips.append(clip)
+                    except Exception as e:
+                        print(f"Error loading clip {fname}: {e}")
+
+            if not clips:
+                return None
+
+            # 4. Concatenate
+            final_clip = concatenate_videoclips(clips, method="compose")
+            
+            # Write to a temp file that persists after this block
+            output_path = tempfile.mktemp(suffix=".mp4")
+            final_clip.write_videofile(output_path, fps=15, codec="libx264", audio=False, logger=None)
+            
+            # Cleanup clips
+            final_clip.close()
+            for c in clips:
+                c.close()
+                
+            return output_path
+            
+    except Exception as e:
+        st.error(f"Video generation failed: {e}")
+        return None
+
+
+import time
+
 def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
     """
-    Use OpenAI API to simplify segment text.
-    Returns: {"explanation": str, "keywords": list[str]} (3–5 keywords).
-    When accessibility_mode=True uses a shorter, simpler prompt.
+    Uses Gemini to simplify text and extract keywords OR ASL Gloss.
     """
     if not text or not text.strip():
-        return {"explanation": "", "keywords": []}
+        return {"explanation": "", "keywords": [], "asl_gloss": []}
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         try:
@@ -287,47 +402,8 @@ def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
             pass
 
     if not api_key:
-        st.sidebar.warning("⚠️ Enter Gemini API Key to enable AI features.")
-    else:
-        genai.configure(api_key=api_key)
-        
-        # --- Ask the Video (Chat) ---
-        with st.sidebar:
-            st.divider()
-            st.header("💬 Ask the Video")
-            
-            # Display chat messages
-            chat_container = st.container(height=300)
-            with chat_container:
-                for msg in st.session_state.messages:
-                    with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
-            
-            # Chat Input
-            if prompt := st.chat_input("Ask about the video..."):
-                # Add user message
-                st.session_state.messages.append({"role": "user", "content": prompt})
-                with chat_container:
-                    with st.chat_message("user"):
-                        st.write(prompt)
-                
-                # Generate AI response
-                if not st.session_state.segments:
-                    response_text = "Please transcribe a video first so I can answer questions about it!"
-                else:
-                    # Construct context from transcript
-                    full_transcript = " ".join([seg["text"] for seg in st.session_state.segments])
-                    
-                    try:
-                        model = genai.GenerativeModel('gemini-flash-latest')
-                        chat_prompt = (
-                            f"System: You are an expert tutor. Answer the user's question based strictly on the following video transcript. "
-                            f"If the answer is not in the transcript, say you don't know.\n\n"
-                            f"Transcript: {full_transcript[:100000]}...\n\n" # Limit context to avoid token limits if extremely long
-                            f"User Question: {prompt}"
-        raise ValueError(
-            "GEMINI_API_KEY is not set. Add it to .streamlit/secrets.toml or as an environment variable."
-        )
+        return {"explanation": "API Key missing.", "keywords": [], "asl_gloss": []}
+
     genai.configure(api_key=api_key)
 
     generation_config = {
@@ -337,11 +413,6 @@ def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
         "max_output_tokens": 8192,
         "response_mime_type": "application/json",
     }
-    
-    # Updated Prompt for ASL Gloss
-    # We ask for 'asl_gloss' which is a list of signs in order.
-    # We also keep 'keywords' for backward compatibility or extra tagging if needed, 
-    # but the primary focus for video is gloss.
     
     if accessibility_mode:
         prompt = (
@@ -364,23 +435,37 @@ def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
             "Text to simplify:\n" + text.strip()
         )
 
+    # Reverting to gemini-flash-latest as it has at least 20 req/min for free tier (unlike others with 0)
     model = genai.GenerativeModel('gemini-flash-latest')
-    try:
-        response = model.generate_content(prompt, generation_config=generation_config)
-        raw = response.text.strip()
-        # Clean up potential markdown code blocks
-        if raw.startswith("```json"):
-            raw = raw[7:]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        return json.loads(raw)
-    except Exception as e:
-        return {
-            "explanation": f"Error simplifying text: {str(e)}", 
-            "keywords": [], 
-            "asl_gloss": []
-        }
-
+    
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = model.generate_content(prompt, generation_config=generation_config)
+            raw = response.text.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            return json.loads(raw)
+        except Exception as e:
+            if "429" in str(e):
+                if attempt < retries - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                else:
+                    return {
+                        "explanation": f"⚠️ Free AI Quota Reached. Please wait ~30s and try again. (Limit: 20/min)", 
+                        "keywords": [], 
+                        "asl_gloss": []
+                    }
+            else:
+                # Other errors
+                return {
+                    "explanation": f"Error simplify: {str(e)}", 
+                    "keywords": [], 
+                    "asl_gloss": []
+                }
 
 # Session state
 if "video_bytes" not in st.session_state:
@@ -413,8 +498,74 @@ if not api_key_configured:
     except (FileNotFoundError, KeyError):
         pass
 
-if not api_key_configured:
-    st.sidebar.caption("⚠️ Set **GEMINI_API_KEY** in `.streamlit/secrets.toml` or environment to enable features.")
+if api_key_configured:
+    # --- Ask the Video (Sidebar Chat) ---
+    with st.sidebar:
+        st.divider()
+        st.header("💬 Ask the Video")
+        
+        # Display chat messages
+        chat_container = st.container(height=300)
+        with chat_container:
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+        
+        # Chat Input
+        if prompt := st.chat_input("Ask about the video..."):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with chat_container:
+                with st.chat_message("user"):
+                    st.write(prompt)
+            
+            # Generate AI response
+            if not st.session_state.segments:
+                response_text = "Please transcribe a video first so I can answer questions about it!"
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+            else:
+                # Construct context from transcript
+                full_transcript = " ".join([seg["text"] for seg in st.session_state.segments])
+                
+                try:
+                    # Get key again just to be safe
+                    api_key = os.environ.get("GEMINI_API_KEY")
+                    if not api_key:
+                         try:
+                             api_key = st.secrets["GEMINI_API_KEY"]
+                         except: pass
+                    genai.configure(api_key=api_key)
+                    
+                    model = genai.GenerativeModel('gemini-flash-latest')
+                    chat_prompt = (
+                        f"System: You are an expert tutor. Answer the user's question based strictly on the following video transcript. "
+                        f"If the answer is not in the transcript, say you don't know.\n\n"
+                        f"Transcript: {full_transcript[:100000]}...\n\n" 
+                        f"User Question: {prompt}"
+                    )
+                    
+                    with chat_container:
+                        with st.chat_message("assistant"):
+                            stream = model.generate_content(chat_prompt, stream=True)
+                            
+                            def stream_parser(response_stream):
+                                for chunk in response_stream:
+                                    try:
+                                        if chunk.text:
+                                            yield chunk.text
+                                    except Exception:
+                                        pass
+                                        
+                            response_text = st.write_stream(stream_parser(stream))
+                    
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+                except Exception as e:
+                    response_text = f"Error: {str(e)}"
+                    with chat_container:
+                        st.error(response_text)
+                        
+
 
 st.title("🎓 EquiLearn")
 st.caption("Upload an MP4 or paste a YouTube link → transcribe with Whisper → watch with segmented transcript.")
@@ -515,7 +666,8 @@ if (video_bytes_for_player is not None or st.session_state.get("yt_embed_id")) a
         if active_idx is not None:
             seg = st.session_state.segments[active_idx]
             segment_text = seg["text"] # Renamed from 'text' to avoid conflict with prompt 'text'
-            cache_key = f"{active_idx}:{hash(segment_text)}"
+            # Include accessibility_mode in cache key so toggling it forces a re-generation with the new prompt
+            cache_key = f"{active_idx}:{hash(segment_text)}:{accessibility_mode}"
             
             st.markdown('<div class="simplify-card">', unsafe_allow_html=True)
             st.markdown('<div class="simplify-header">✨ AI Simplifier & Sign Language</div>', unsafe_allow_html=True)
@@ -550,41 +702,46 @@ if (video_bytes_for_player is not None or st.session_state.get("yt_embed_id")) a
                 
                 st.markdown(f"<div class='simplify-header'>Explanation:</div> {explanation}", unsafe_allow_html=True)
                 
-                # Match GLOSS terms to Signs
+                # Match GLOSS terms to Signs (for UI display - still shows only what matches)
                 signs = load_signs() # Load signs here
                 matched_gloss = match_keywords_to_gifs(gloss_terms, signs)
                 
-                if matched_gloss:
+                # Show ANY matched terms or just the list
+                if gloss_terms:
                     st.markdown("**ASL Gloss (Sign Sequence):**")
                     # Display tags for the gloss
-                    tags_html = "".join([f"<span class='keyword-tag'>{term}</span>" for term, _ in matched_gloss])
+                    tags_html = "".join([f"<span class='keyword-tag'>{term}</span>" for term in gloss_terms])
                     st.markdown(f"<div>{tags_html}</div>", unsafe_allow_html=True)
                     
-                    # Generate Video Button
+                    # Generate Video Button (Always available if we have gloss terms)
                     if st.button("🎥 Generate Sign Language Video"):
-                        with st.spinner("Stitching sign language video..."):
-                            video_path = generate_sign_video(matched_gloss)
+                        with st.spinner("Stitching sign language video (fingerspelling missing terms)..."):
+                            # Pass raw gloss terms + signs_db to handle mix of signs and fingerspelling
+                            video_path = generate_sign_video(gloss_terms, signs)
                             if video_path:
                                 st.video(video_path)
                                 with open(video_path, "rb") as vf:
                                     st.download_button("Download Video", vf, "sign_language.mp4", "video/mp4")
                             else:
-                                st.warning("Could not generate video. Sign GIFs might be unavailable.")
+                                st.warning("Could not generate video.")
 
                     # Individual GIFs fallback (optional or distinct section)
                     with st.expander("View Individual Signs"):
-                        cols = st.columns(4)
-                        for i, (keyword, gif_path_or_url) in enumerate(matched_gloss):
-                            with cols[i % 4]:
-                                if gif_path_or_url.startswith("http"):
-                                    st.image(gif_path_or_url, caption=keyword, use_container_width=True)
-                                else:
-                                    # Fallback for local files if any
-                                    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), gif_path_or_url)
-                                    if os.path.isfile(full_path):
-                                        st.image(full_path, caption=keyword, use_container_width=True)
+                        if matched_gloss:
+                            cols = st.columns(4)
+                            for i, (keyword, gif_path_or_url) in enumerate(matched_gloss):
+                                with cols[i % 4]:
+                                    if gif_path_or_url.startswith("http"):
+                                        st.image(gif_path_or_url, caption=keyword, use_container_width=True)
+                                    else:
+                                        # Fallback for local files if any
+                                        full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), gif_path_or_url)
+                                        if os.path.isfile(full_path):
+                                            st.image(full_path, caption=keyword, use_container_width=True)
+                        else:
+                            st.caption("No whole-word signs found. Video will assume fingerspelling for all.")
                 else:
-                    st.caption("No matching sign language GIFs found for this explanation.")
+                    st.caption("No gloss generated.")
             elif not should_simplify and not accessibility_mode:
                 st.info("Click 'Simplify' to get an AI explanation and ASL signs for this segment.")
                 
