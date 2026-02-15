@@ -16,6 +16,9 @@ import streamlit as st
 import whisper
 import google.generativeai as genai
 import requests
+import tempfile
+from moviepy import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
+import os
 
 # Use unverified SSL context so Whisper model download works behind corporate proxy / self-signed certs
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -322,61 +325,61 @@ def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
                             f"If the answer is not in the transcript, say you don't know.\n\n"
                             f"Transcript: {full_transcript[:100000]}...\n\n" # Limit context to avoid token limits if extremely long
                             f"User Question: {prompt}"
-                        )
-                        
-                        with chat_container:
-                            with st.chat_message("assistant"):
-                                stream = model.generate_content(chat_prompt, stream=True)
-                                response_text = st.write_stream(stream)
-                                
-                    except Exception as e:
-                        response_text = f"Error: {str(e)}"
-                        with chat_container:
-                            st.error(response_text)
-                
-                # Add assistant message
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
-    
-    # Use a model that supports JSON mode or good instruction following
-    model = genai.GenerativeModel('gemini-flash-latest')
+        raise ValueError(
+            "GEMINI_API_KEY is not set. Add it to .streamlit/secrets.toml or as an environment variable."
+        )
+    genai.configure(api_key=api_key)
 
+    generation_config = {
+        "temperature": 0.4,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_output_tokens": 8192,
+        "response_mime_type": "application/json",
+    }
+    
+    # Updated Prompt for ASL Gloss
+    # We ask for 'asl_gloss' which is a list of signs in order.
+    # We also keep 'keywords' for backward compatibility or extra tagging if needed, 
+    # but the primary focus for video is gloss.
+    
     if accessibility_mode:
         prompt = (
-            "System: Return only valid JSON: {\"explanation\": \"...\", \"keywords\": [\"root_word1\", \"root_word2\", ...]}.\n"
-            "User: Simplify in plain language. Short sentences. One example. "
-            "3–5 keywords in their ROOT form (singular, present tense, e.g. 'measuring' -> 'measure'). JSON with keys explanation and keywords.\n\n" + text.strip()
+            "System: Return only valid JSON: {\"explanation\": \"...\", \"asl_gloss\": [\"WORD1\", \"WORD2\", ...]}.\n"
+            "User: Simplify in plain language. Short sentences. one example. "
+            "Translate the meaning into ASL GLOSS (root words, ALL CAPS, time-topic-comment structure). "
+            "Example: 'I went to store' -> ['ME', 'GO', 'STORE', 'FINISH'].\n"
+            "JSON keys: explanation, asl_gloss.\n\n" + text.strip()
         )
     else:
         prompt = (
-            "System: You return only valid JSON, no markdown or extra text.\n"
-            "User: Simplify this text for a general audience. Rules:\n"
-            "- Use short sentences only.\n"
-            "- Avoid jargon; use plain language.\n"
-            "- Include exactly one simple, concrete example.\n"
-            "- Return valid JSON with two keys only:\n"
-            "  - \"explanation\": your simplified explanation (one or two short paragraphs).\n"
-            "  - \"keywords\": a list of 3 to 5 key terms (strings) in their ROOT form (singular, present tense). E.g. 'rectangles' -> 'rectangle'.\n\n"
+            "System: Return only valid JSON.\n"
+            "User: Simplify text for general audience.\n"
+            "- Short sentences, no jargon.\n"
+            "- One concrete example.\n"
+            "- Provide an ASL GLOSS translation of the summary (root words, ALL CAPS, grammar of American Sign Language).\n"
+            "Return JSON with keys:\n"
+            "  - \"explanation\": string\n"
+            "  - \"asl_gloss\": list of strings (the sign sequence)\n\n"
             "Text to simplify:\n" + text.strip()
         )
 
-    generation_config = genai.GenerationConfig(response_mime_type="application/json")
-    
+    model = genai.GenerativeModel('gemini-flash-latest')
     try:
         response = model.generate_content(prompt, generation_config=generation_config)
         raw = response.text.strip()
+        # Clean up potential markdown code blocks
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        return json.loads(raw)
     except Exception as e:
-        # Fallback or re-raise
-        raise e
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    out = json.loads(raw)
-    return {
-        "explanation": out.get("explanation", ""),
-        "keywords": out.get("keywords", [])[:5],
-    }
+        return {
+            "explanation": f"Error simplifying text: {str(e)}", 
+            "keywords": [], 
+            "asl_gloss": []
+        }
 
 
 # Session state
@@ -400,6 +403,7 @@ if "yt_embed_id" not in st.session_state:
 
 # Sidebar: Accessibility Mode
 accessibility_mode = st.sidebar.toggle("Accessibility Mode", value=False, help="Auto-simplify segments, show sign GIFs, use simpler prompt.")
+st.session_state.accessibility_mode = accessibility_mode # Store in session state for simplify_segment call
 
 api_key_configured = os.environ.get("GEMINI_API_KEY") is not None
 if not api_key_configured:
@@ -510,8 +514,8 @@ if (video_bytes_for_player is not None or st.session_state.get("yt_embed_id")) a
         # 4. Simplify Section (Below Video)
         if active_idx is not None:
             seg = st.session_state.segments[active_idx]
-            text = seg["text"]
-            cache_key = f"{active_idx}:{hash(text)}"
+            segment_text = seg["text"] # Renamed from 'text' to avoid conflict with prompt 'text'
+            cache_key = f"{active_idx}:{hash(segment_text)}"
             
             st.markdown('<div class="simplify-card">', unsafe_allow_html=True)
             st.markdown('<div class="simplify-header">✨ AI Simplifier & Sign Language</div>', unsafe_allow_html=True)
@@ -529,41 +533,58 @@ if (video_bytes_for_player is not None or st.session_state.get("yt_embed_id")) a
             if should_simplify and cache_key not in st.session_state.simplified_cache:
                 with st.spinner("Simplifying..."):
                     try:
-                        st.session_state.simplified_cache[cache_key] = simplify_segment(text, accessibility_mode)
+                        st.session_state.simplified_cache[cache_key] = simplify_segment(segment_text, accessibility_mode)
                     except Exception as e:
                         st.error(f"API Error: {e}")
                         st.session_state.simplified_cache[cache_key] = None
 
             # Display Simplification Results
             if cache_key in st.session_state.simplified_cache and st.session_state.simplified_cache[cache_key]:
-                data = st.session_state.simplified_cache[cache_key]
+                result = st.session_state.simplified_cache[cache_key]
                 
-                # Explanation
-                st.markdown(f"**Explanation:** {data['explanation']}")
+                explanation = result.get("explanation", "Could not generate an explanation.")
+                # Fallback: look for 'asl_gloss' first, then 'keywords'
+                gloss_terms = result.get("asl_gloss", [])
+                if not gloss_terms:
+                    gloss_terms = result.get("keywords", [])
                 
-                # Keywords
-                if data.get("keywords"):
-                    kw_html = "".join([f'<span class="keyword-tag">{k}</span>' for k in data["keywords"]])
-                    st.markdown(f"<div style='margin-top: 10px; margin-bottom: 15px;'>{kw_html}</div>", unsafe_allow_html=True)
-
-                # Signs
-                signs = load_signs()
-                matched = match_keywords_to_gifs(data.get("keywords", []), signs)
-                if matched:
-                    st.markdown("**Sign Language Support:**")
-                    cols = st.columns(4)
-                    for i, (keyword, gif_path_or_url) in enumerate(matched):
-                        with cols[i % 4]:
-                            if gif_path_or_url.startswith("http"):
-                                st.image(gif_path_or_url, caption=keyword, use_container_width=True)
+                st.markdown(f"<div class='simplify-header'>Explanation:</div> {explanation}", unsafe_allow_html=True)
+                
+                # Match GLOSS terms to Signs
+                signs = load_signs() # Load signs here
+                matched_gloss = match_keywords_to_gifs(gloss_terms, signs)
+                
+                if matched_gloss:
+                    st.markdown("**ASL Gloss (Sign Sequence):**")
+                    # Display tags for the gloss
+                    tags_html = "".join([f"<span class='keyword-tag'>{term}</span>" for term, _ in matched_gloss])
+                    st.markdown(f"<div>{tags_html}</div>", unsafe_allow_html=True)
+                    
+                    # Generate Video Button
+                    if st.button("🎥 Generate Sign Language Video"):
+                        with st.spinner("Stitching sign language video..."):
+                            video_path = generate_sign_video(matched_gloss)
+                            if video_path:
+                                st.video(video_path)
+                                with open(video_path, "rb") as vf:
+                                    st.download_button("Download Video", vf, "sign_language.mp4", "video/mp4")
                             else:
-                                full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), gif_path_or_url)
-                                if os.path.isfile(full_path):
-                                    st.image(full_path, caption=keyword, use_container_width=True)
+                                st.warning("Could not generate video. Sign GIFs might be unavailable.")
+
+                    # Individual GIFs fallback (optional or distinct section)
+                    with st.expander("View Individual Signs"):
+                        cols = st.columns(4)
+                        for i, (keyword, gif_path_or_url) in enumerate(matched_gloss):
+                            with cols[i % 4]:
+                                if gif_path_or_url.startswith("http"):
+                                    st.image(gif_path_or_url, caption=keyword, use_container_width=True)
                                 else:
-                                    st.caption(f"{keyword} (No GIF)")
+                                    # Fallback for local files if any
+                                    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), gif_path_or_url)
+                                    if os.path.isfile(full_path):
+                                        st.image(full_path, caption=keyword, use_container_width=True)
                 else:
-                    st.caption("No matching sign language GIFs found for these keywords.")
+                    st.caption("No matching sign language GIFs found for this explanation.")
             elif not should_simplify and not accessibility_mode:
                 st.info("Click 'Simplify' to get an AI explanation and ASL signs for this segment.")
                 
