@@ -17,6 +17,6 @@ streamlit run app.py
 - **Transcription** uses OpenAI Whisper (base model; first run downloads the model)
 - **Video player** + **segmented transcript** with timestamps
 - **Seek slider** to jump to a time; current segment is highlighted (session state for pause/rewind tracking)
-- **Simplify segment**: for the active segment, call OpenAI to get a plain-language explanation and 3–5 keywords (set `OPENAI_API_KEY` in env)
+- **Simplify segment**: uses Google Gemini. Add your key to `.streamlit/secrets.toml` or set `GEMINI_API_KEY` env var.
 - **Sign GIFs**: keywords are matched against `signs.json` (sign name → GIF path or URL); matched GIFs are shown below the simplified explanation. Add GIFs in a `signs/` folder or use URLs in `signs.json`.
 

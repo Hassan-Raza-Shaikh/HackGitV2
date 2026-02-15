@@ -14,12 +14,131 @@ warnings.filterwarnings("ignore", message="FP16 is not supported on CPU", module
 
 import streamlit as st
 import whisper
-from openai import OpenAI
+import google.generativeai as genai
+import requests
 
 # Use unverified SSL context so Whisper model download works behind corporate proxy / self-signed certs
 ssl._create_default_https_context = ssl._create_unverified_context
 
 st.set_page_config(page_title="EquiLearn", page_icon="🎓", layout="wide")
+
+# --- Custom CSS ---
+st.markdown("""
+<style>
+    /* Global Font & Colors */
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Poppins', sans-serif;
+        color: #333;
+    }
+    
+    .stApp {
+        background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
+    }
+
+    /* Video Player Container */
+    .stVideo {
+        border-radius: 20px;
+        overflow: hidden;
+        box-shadow: 0 10px 25px rgba(100, 100, 250, 0.2);
+        border: 4px solid #fff;
+    }
+
+    /* Active Segment Highlight */
+    .active-segment {
+        background: linear-gradient(90deg, #fff 0%, #f3e5f5 100%);
+        border-left: 6px solid #d500f9;
+        padding: 16px;
+        margin-bottom: 12px;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(213, 0, 249, 0.15);
+        transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        transform: scale(1.02);
+    }
+
+    /* Inactive Segment */
+    .inactive-segment {
+        background-color: #ffffff;
+        border: 1px solid #f0f0f0;
+        padding: 14px;
+        margin-bottom: 10px;
+        border-radius: 12px;
+        color: #666;
+        transition: all 0.2s ease;
+    }
+    .inactive-segment:hover {
+        border-color: #d500f9;
+        transform: translateX(4px);
+    }
+
+    /* Simplify Card */
+    .simplify-card {
+        background: white;
+        border-radius: 24px;
+        padding: 24px;
+        margin-top: 24px;
+        border: 2px solid #e0e0e0;
+        box-shadow: 8px 8px 0px rgba(0,0,0,0.05); /* Pop art style shadow */
+        background-image: radial-gradient(#f3e5f5 1px, transparent 1px);
+        background-size: 20px 20px;
+    }
+
+    .simplify-header {
+        font-size: 1.4rem;
+        font-weight: 800;
+        background: -webkit-linear-gradient(45deg, #d500f9, #651fff);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 1rem;
+    }
+
+    .keyword-tag {
+        display: inline-block;
+        background: linear-gradient(45deg, #ff4081, #d500f9);
+        color: white;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-size: 0.9rem;
+        font-weight: 700;
+        margin-right: 8px;
+        margin-bottom: 8px;
+        box-shadow: 0 4px 10px rgba(213, 0, 249, 0.3);
+    }
+    
+    /* Buttons */
+    .stButton > button {
+        background: linear-gradient(45deg, #651fff, #d500f9);
+        color: white;
+        border-radius: 12px;
+        font-weight: 700;
+        border: none;
+        padding: 0.6rem 1.2rem;
+        box-shadow: 0 4px 14px rgba(101, 31, 255, 0.4);
+        transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .stButton > button:hover {
+        transform: scale(1.05) translateY(-2px);
+        box-shadow: 0 6px 20px rgba(101, 31, 255, 0.5);
+        color: white;
+    }
+    .stButton > button:active {
+        transform: scale(0.95);
+    }
+
+    /* Headers */
+    h1 {
+        font-weight: 800;
+        background: -webkit-linear-gradient(0deg, #2979ff, #d500f9);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    h2, h3 {
+        color: #37474f;
+        font-weight: 700;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 SIGNS_PATH = os.path.join(os.path.dirname(__file__), "signs.json")
 
@@ -79,22 +198,73 @@ def load_signs():
         return json.load(f)
 
 
+def get_sign_url(word: str, signs_db: dict) -> str | None:
+    """
+    Find a sign URL for a word.
+    1. Check local signs.json
+    2. Try varying suffixes (e.g. remove 's', 'ing') if not found locally.
+    3. Try fetching from Lifeprint (asl101.com) dynamically.
+    """
+    word = word.strip().lower()
+    if not word:
+        return None
+        
+    # 1. Local Lookup
+    if word in signs_db:
+        return signs_db[word]
+    
+    # Check session cache for dynamic lookups
+    if "sign_url_cache" not in st.session_state:
+        st.session_state.sign_url_cache = {}
+    
+    if word in st.session_state.sign_url_cache:
+        return st.session_state.sign_url_cache[word]
+
+    # 2. Dynamic Lookup (Lifeprint)
+    # Common pattern: https://www.lifeprint.com/asl101/gifs/{first_letter}/{word}.gif
+    first_letter = word[0]
+    # Try exact word
+    candidate_url = f"https://www.lifeprint.com/asl101/gifs/{first_letter}/{word}.gif"
+    
+    try:
+        # Use a timeout to avoid hanging
+        resp = requests.head(candidate_url, timeout=1.5)
+        if resp.status_code == 200:
+            st.session_state.sign_url_cache[word] = candidate_url
+            return candidate_url
+    except Exception:
+        pass
+        
+    # Cache failure to avoid repeated bad requests
+    st.session_state.sign_url_cache[word] = None
+    return None
+
+
 def match_keywords_to_gifs(keywords, signs):
     """
-    Match extracted keywords to signs (case-insensitive).
+    Match extracted keywords to signs using dynamic lookup.
     Returns list of (keyword, gif_path_or_url) for each match.
     """
-    if not keywords or not signs:
+    if not keywords:
         return []
+        
     matched = []
     seen = set()
+    
+    # Pre-load cache for batch
+    if "sign_url_cache" not in st.session_state:
+        st.session_state.sign_url_cache = {}
+
     for kw in keywords:
         key = kw.strip().lower()
         if not key or key in seen:
             continue
-        if key in signs:
-            matched.append((kw.strip(), signs[key]))
+            
+        url = get_sign_url(key, signs)
+        if url:
+            matched.append((kw.strip(), url))
             seen.add(key)
+
     return matched
 
 
@@ -106,39 +276,97 @@ def simplify_segment(text: str, accessibility_mode: bool = False) -> dict:
     """
     if not text or not text.strip():
         return {"explanation": "", "keywords": []}
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError(
-            "OPENAI_API_KEY is not set. Add your API key to the environment, e.g. "
-            "export OPENAI_API_KEY=sk-... in the terminal before running Streamlit."
-        )
-    client = OpenAI()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except (FileNotFoundError, KeyError):
+            pass
+
+    if not api_key:
+        st.sidebar.warning("⚠️ Enter Gemini API Key to enable AI features.")
+    else:
+        genai.configure(api_key=api_key)
+        
+        # --- Ask the Video (Chat) ---
+        with st.sidebar:
+            st.divider()
+            st.header("💬 Ask the Video")
+            
+            # Display chat messages
+            chat_container = st.container(height=300)
+            with chat_container:
+                for msg in st.session_state.messages:
+                    with st.chat_message(msg["role"]):
+                        st.write(msg["content"])
+            
+            # Chat Input
+            if prompt := st.chat_input("Ask about the video..."):
+                # Add user message
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with chat_container:
+                    with st.chat_message("user"):
+                        st.write(prompt)
+                
+                # Generate AI response
+                if not st.session_state.segments:
+                    response_text = "Please transcribe a video first so I can answer questions about it!"
+                else:
+                    # Construct context from transcript
+                    full_transcript = " ".join([seg["text"] for seg in st.session_state.segments])
+                    
+                    try:
+                        model = genai.GenerativeModel('gemini-flash-latest')
+                        chat_prompt = (
+                            f"System: You are an expert tutor. Answer the user's question based strictly on the following video transcript. "
+                            f"If the answer is not in the transcript, say you don't know.\n\n"
+                            f"Transcript: {full_transcript[:100000]}...\n\n" # Limit context to avoid token limits if extremely long
+                            f"User Question: {prompt}"
+                        )
+                        
+                        with chat_container:
+                            with st.chat_message("assistant"):
+                                stream = model.generate_content(chat_prompt, stream=True)
+                                response_text = st.write_stream(stream)
+                                
+                    except Exception as e:
+                        response_text = f"Error: {str(e)}"
+                        with chat_container:
+                            st.error(response_text)
+                
+                # Add assistant message
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+    
+    # Use a model that supports JSON mode or good instruction following
+    model = genai.GenerativeModel('gemini-flash-latest')
+
     if accessibility_mode:
-        system = "Return only valid JSON: {\"explanation\": \"...\", \"keywords\": [\"a\", \"b\", ...]}."
-        user = (
-            "Simplify in plain language. Short sentences. One example. "
-            "3–5 keywords. JSON with keys explanation and keywords.\n\n" + text.strip()
+        prompt = (
+            "System: Return only valid JSON: {\"explanation\": \"...\", \"keywords\": [\"root_word1\", \"root_word2\", ...]}.\n"
+            "User: Simplify in plain language. Short sentences. One example. "
+            "3–5 keywords in their ROOT form (singular, present tense, e.g. 'measuring' -> 'measure'). JSON with keys explanation and keywords.\n\n" + text.strip()
         )
     else:
-        system = "You return only valid JSON, no markdown or extra text."
-        user = """Simplify this text for a general audience. Rules:
-- Use short sentences only.
-- Avoid jargon; use plain language.
-- Include exactly one simple, concrete example.
-- Return valid JSON with two keys only:
-  - "explanation": your simplified explanation (one or two short paragraphs).
-  - "keywords": a list of 3 to 5 key terms (strings).
+        prompt = (
+            "System: You return only valid JSON, no markdown or extra text.\n"
+            "User: Simplify this text for a general audience. Rules:\n"
+            "- Use short sentences only.\n"
+            "- Avoid jargon; use plain language.\n"
+            "- Include exactly one simple, concrete example.\n"
+            "- Return valid JSON with two keys only:\n"
+            "  - \"explanation\": your simplified explanation (one or two short paragraphs).\n"
+            "  - \"keywords\": a list of 3 to 5 key terms (strings) in their ROOT form (singular, present tense). E.g. 'rectangles' -> 'rectangle'.\n\n"
+            "Text to simplify:\n" + text.strip()
+        )
 
-Text to simplify:
-""" + text.strip()
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.3,
-    )
-    raw = response.choices[0].message.content.strip()
+    generation_config = genai.GenerationConfig(response_mime_type="application/json")
+    
+    try:
+        response = model.generate_content(prompt, generation_config=generation_config)
+        raw = response.text.strip()
+    except Exception as e:
+        # Fallback or re-raise
+        raise e
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -154,8 +382,11 @@ Text to simplify:
 # Session state
 if "video_bytes" not in st.session_state:
     st.session_state.video_bytes = None
+# Session state initialization
 if "segments" not in st.session_state:
     st.session_state.segments = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 if "current_time" not in st.session_state:
     st.session_state.current_time = 0.0
 if "duration" not in st.session_state:
@@ -169,8 +400,17 @@ if "yt_embed_id" not in st.session_state:
 
 # Sidebar: Accessibility Mode
 accessibility_mode = st.sidebar.toggle("Accessibility Mode", value=False, help="Auto-simplify segments, show sign GIFs, use simpler prompt.")
-if not os.environ.get("OPENAI_API_KEY"):
-    st.sidebar.caption("⚠️ Set **OPENAI_API_KEY** in your environment to enable **Simplify** and Accessibility Mode.")
+
+api_key_configured = os.environ.get("GEMINI_API_KEY") is not None
+if not api_key_configured:
+    try:
+        if st.secrets["GEMINI_API_KEY"]:
+            api_key_configured = True
+    except (FileNotFoundError, KeyError):
+        pass
+
+if not api_key_configured:
+    st.sidebar.caption("⚠️ Set **GEMINI_API_KEY** in `.streamlit/secrets.toml` or environment to enable features.")
 
 st.title("🎓 EquiLearn")
 st.caption("Upload an MP4 or paste a YouTube link → transcribe with Whisper → watch with segmented transcript.")
@@ -235,91 +475,127 @@ if media_path is not None and source_id is not None:
                 st.session_state.yt_embed_id = yt_embed_id
 
 if (video_bytes_for_player is not None or st.session_state.get("yt_embed_id")) and st.session_state.segments:
-    col_video, col_transcript = st.columns([1, 1])
+    col_main, col_transcript = st.columns([1.8, 1.2], gap="large")
 
-    with col_video:
+    with col_main:
+        # 1. Video Player
         if video_bytes_for_player is not None:
             st.video(video_bytes_for_player)
         else:
             eid = st.session_state.yt_embed_id
             st.markdown(
-                f'<iframe width="100%" height="315" src="https://www.youtube.com/embed/{eid}" '
+                f'<iframe width="100%" height="400" src="https://www.youtube.com/embed/{eid}" '
+                'style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);" '
                 'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>',
                 unsafe_allow_html=True,
             )
+        
+        # 2. Seek Slider
         st.session_state.current_time = st.slider(
             "Seek (s)",
             0.0,
             max(st.session_state.duration, 1.0),
             st.session_state.current_time,
             0.5,
-            help="Move to sync transcript with playback.",
+            label_visibility="collapsed"
         )
 
-    with col_transcript:
-        st.subheader("Transcript (segments)")
+        # 3. Determine Active Segment
         active_idx = None
         for i, seg in enumerate(st.session_state.segments):
-            start, end, text = seg["start"], seg["end"], seg["text"]
-            if not text:
-                continue
-            is_active = start <= st.session_state.current_time < end
-            if is_active:
+            if seg["start"] <= st.session_state.current_time < seg["end"]:
                 active_idx = i
-            st.markdown(
-                f'<div style="padding: 0.5rem 0.75rem; margin: 0.25rem 0; border-radius: 6px; '
-                f'background: {"#e3f2fd" if is_active else "#f5f5f5"}; '
-                f'border-left: 4px solid {"#1976d2" if is_active else "transparent"}; '
-                f'font-size: 0.95rem;">'
-                f'<span style="color: #666; font-size: 0.8rem;">[{start:.1f}s – {end:.1f}s]</span> {text}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+                break
 
-        # Simplified explanation + keywords for active segment
+        # 4. Simplify Section (Below Video)
         if active_idx is not None:
             seg = st.session_state.segments[active_idx]
             text = seg["text"]
             cache_key = f"{active_idx}:{hash(text)}"
-            if cache_key not in st.session_state.simplified_cache:
-                if accessibility_mode:
-                    with st.spinner("Simplifying…"):
-                        try:
-                            st.session_state.simplified_cache[cache_key] = simplify_segment(text, accessibility_mode=True)
-                        except Exception as e:
-                            st.error(f"API error: {e}")
-                            st.session_state.simplified_cache[cache_key] = None
-                elif st.button("Simplify this segment", key="simplify_btn"):
-                    with st.spinner("Simplifying…"):
-                        try:
-                            st.session_state.simplified_cache[cache_key] = simplify_segment(text)
-                        except Exception as e:
-                            st.error(f"API error: {e}")
-                            st.session_state.simplified_cache[cache_key] = None
+            
+            st.markdown('<div class="simplify-card">', unsafe_allow_html=True)
+            st.markdown('<div class="simplify-header">✨ AI Simplifier & Sign Language</div>', unsafe_allow_html=True)
+            
+            # Logic to fetch simplification
+            should_simplify = False
+            if cache_key in st.session_state.simplified_cache:
+                should_simplify = True  # Already cached
+            elif accessibility_mode:
+                should_simplify = True  # Auto-simplify
+            else:
+                if st.button("Simplify Current Segment", key=f"simplify_btn_{active_idx}", use_container_width=True, type="primary"):
+                    should_simplify = True
+
+            if should_simplify and cache_key not in st.session_state.simplified_cache:
+                with st.spinner("Simplifying..."):
+                    try:
+                        st.session_state.simplified_cache[cache_key] = simplify_segment(text, accessibility_mode)
+                    except Exception as e:
+                        st.error(f"API Error: {e}")
+                        st.session_state.simplified_cache[cache_key] = None
+
+            # Display Simplification Results
             if cache_key in st.session_state.simplified_cache and st.session_state.simplified_cache[cache_key]:
                 data = st.session_state.simplified_cache[cache_key]
-                st.markdown("---")
-                st.markdown("**Simplified**")
-                st.markdown(data["explanation"])
+                
+                # Explanation
+                st.markdown(f"**Explanation:** {data['explanation']}")
+                
+                # Keywords
                 if data.get("keywords"):
-                    st.caption("Keywords: " + ", ".join(data["keywords"]))
+                    kw_html = "".join([f'<span class="keyword-tag">{k}</span>' for k in data["keywords"]])
+                    st.markdown(f"<div style='margin-top: 10px; margin-bottom: 15px;'>{kw_html}</div>", unsafe_allow_html=True)
 
+                # Signs
                 signs = load_signs()
                 matched = match_keywords_to_gifs(data.get("keywords", []), signs)
                 if matched:
-                    st.markdown("**Signs**")
-                    base_dir = os.path.dirname(os.path.abspath(__file__))
-                    cols = st.columns(len(matched))
+                    st.markdown("**Sign Language Support:**")
+                    cols = st.columns(4)
                     for i, (keyword, gif_path_or_url) in enumerate(matched):
-                        with cols[i]:
+                        with cols[i % 4]:
                             if gif_path_or_url.startswith("http"):
                                 st.image(gif_path_or_url, caption=keyword, use_container_width=True)
                             else:
-                                full_path = os.path.join(base_dir, gif_path_or_url)
+                                full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), gif_path_or_url)
                                 if os.path.isfile(full_path):
                                     st.image(full_path, caption=keyword, use_container_width=True)
                                 else:
-                                    st.caption(f"{keyword} (no GIF)")
+                                    st.caption(f"{keyword} (No GIF)")
+                else:
+                    st.caption("No matching sign language GIFs found for these keywords.")
+            elif not should_simplify and not accessibility_mode:
+                st.info("Click 'Simplify' to get an AI explanation and ASL signs for this segment.")
+                
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.info("Play the video to see content here.")
+
+    with col_transcript:
+        st.subheader("Transcript")
+        # Scrollable container for transcript
+        with st.container(height=600):
+            for i, seg in enumerate(st.session_state.segments):
+                start, end, text = seg["start"], seg["end"], seg["text"]
+                if not text:
+                    continue
+                
+                is_active = (i == active_idx)
+                # Scroll to active? Streamlit doesn't support programmatic scroll yet easily, 
+                # but we can highlight visually.
+                
+                css_class = "active-segment" if is_active else "inactive-segment"
+                timestamp = f"{int(start // 60)}:{int(start % 60):02d}"
+                
+                st.markdown(
+                    f'''
+                    <div class="{css_class}" id="seg-{i}">
+                        <div style="font-size: 0.8rem; color: #888; margin-bottom: 4px;">{timestamp}</div>
+                        <div style="font-size: 0.95rem; line-height: 1.4;">{text}</div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True
+                )
 
 else:
     st.info("Upload an MP4 file or paste a YouTube link to get started.")
