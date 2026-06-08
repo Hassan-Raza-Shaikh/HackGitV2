@@ -1,22 +1,26 @@
-# HackGitV2
+# HackGitV2 - Gemini API Sign Language Interpreter
 
-## EquiLearn
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-000000?style=for-the-badge&logo=flask&logoColor=white)
+![Google Gemini](https://img.shields.io/badge/Gemini_API-8E75C2?style=for-the-badge&logo=google&logoColor=white)
 
-Minimal Streamlit app: upload MP4 → transcribe with Whisper → watch with segmented transcript.
+A Python back-end web application that leverages Google's Gemini API multimodal capabilities to analyze sign language visuals and translate them into text/speech.
 
-**Requirements:** Python deps + **ffmpeg** (for Whisper). On macOS: `brew install ffmpeg`.
+## Key Features
+*   **Flask Web Server**: Simple REST API hosting the translation endpoint.
+*   **Gemini API Integration**: Multimodal prompt pipelines analyzing images and streams.
+*   **Structured Metadata Mapping**: Predefined mappings for sign classifications in `signs.json`.
 
-`.streamlit/config.toml` disables the file watcher to avoid a Streamlit/PyTorch conflict (torch `__path__` inspection).
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-- **Upload** a short MP4
-- **Transcription** uses OpenAI Whisper (base model; first run downloads the model)
-- **Video player** + **segmented transcript** with timestamps
-- **Seek slider** to jump to a time; current segment is highlighted (session state for pause/rewind tracking)
-- **Simplify segment**: uses Google Gemini. Add your key to `.streamlit/secrets.toml` or set `GEMINI_API_KEY` env var.
-- **Sign GIFs**: keywords are matched against `signs.json` (sign name → GIF path or URL); matched GIFs are shown below the simplified explanation. Add GIFs in a `signs/` folder or use URLs in `signs.json`.
-
+## Setup Instructions
+1. Clone and install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Configure your API key:
+   ```bash
+   export GEMINI_API_KEY="your_api_key_here"
+   ```
+3. Run the Flask server:
+   ```bash
+   python app.py
+   ```
